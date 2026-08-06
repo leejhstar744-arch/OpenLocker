@@ -1,0 +1,11 @@
+run_index,elapsed_sec,status,detail
+0,5.741383537000274,ok,"55
+"
+1,8.696809351000411,error,"실행 중 오류 출력: Traceback (most recent call last):
+  File ""<stri"
+2,6.158024099999693,ok,"55
+"
+3,8.542380582000078,ok,"55
+"
+4,8.697719702000086,ok,"55
+"

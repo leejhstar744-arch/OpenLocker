@@ -1,0 +1,21 @@
+run_index,elapsed_sec,status,detail
+0,5.6006759050001165,ok,"```json
+{""tool"": ""run_code"", ""args"": {""language"": ""python"", "
+1,7.415240095999707,ok,"```json
+{""tool"": ""run_code"", ""args"": {""language"": ""python"", "
+2,7.574812519000261,ok,"```json
+{""tool"": ""run_code"", ""args"": {""language"": ""python"", "
+3,12.900062067999897,ok,"```json
+{""tool"": ""run_code"", ""args"": {""language"": ""python"", "
+4,7.680091382999763,ok,"```json
+{""tool"": ""run_code"", ""args"": {""language"": ""python"", "
+5,5.616246600000068,ok,"```json
+{""tool"": ""run_code"", ""args"": {""language"": ""python"", "
+6,7.815245861000221,ok,"```json
+{""tool"": ""run_code"", ""args"": {""language"": ""python"", "
+7,6.931041177000225,ok,"```json
+{""tool"": ""run_code"", ""args"": {""language"": ""python"", "
+8,5.602603812000325,ok,"```json
+{""tool"": ""run_code"", ""args"": {""language"": ""python"", "
+9,9.14792020699997,ok,"```json
+{""tool"": ""run_code"", ""args"": {""language"": ""python"", "

@@ -8,7 +8,7 @@ AI/LLM 계층 통합 모듈 (ai_llm_layer.py)
 이 파일이 반환하는 결과는 그대로 ② 백엔드/파이프라인 계층(이벤트 중계 API)에
 전달할 수 있는 형태로 정리된다. 즉 이 모듈의 산출물이 다음 계층의 입력 규격이다.
 
-사전 준비 (지후님 로컬 PC에서):
+사전 준비 (로컬 PC에서):
     curl -fsSL https://ollama.com/install.sh | sh
     ollama pull llama3.2:3b
     ollama serve   # 보통 설치 시 자동으로 백그라운드 서비스 등록됨
@@ -87,10 +87,37 @@ SYSTEM_PROMPT = """당신은 코드 실행을 도와주는 에이전트입니다
 {"tool": "run_code", "args": {"language": "python", "code": "numbers = [3, 1, 4, 1, 5]\\nprint(sorted(numbers))"}}
 ```
 
+예시 3) 데이터 분석/시각화 요청 - 반드시 아래 패턴을 그대로 따르세요
+사용자: "월별 매출 데이터를 분석해서 막대그래프로 시각화해줘"
+답변:
+```json
+{"tool": "run_code", "args": {"language": "python", "code": "import pandas as pd\\nimport matplotlib\\nmatplotlib.use('Agg')\\nimport matplotlib.pyplot as plt\\nplt.rcParams['font.family'] = 'NanumGothic'\\nimport io, base64\\n\\ndata = {'month': ['1월','2월','3월','4월'], 'sales': [120, 135, 98, 150]}\\ndf = pd.DataFrame(data)\\nprint(df.describe())\\n\\nx_pos = range(len(df))\\nfig, ax = plt.subplots()\\nax.bar(x_pos, df['sales'])\\nax.set_xticks(list(x_pos))\\nax.set_xticklabels(df['month'])\\nax.set_title('Monthly Sales')\\n\\nbuf = io.BytesIO()\\nfig.savefig(buf, format='png')\\nbuf.seek(0)\\nprint('PLOT_BASE64:' + base64.b64encode(buf.read()).decode())"}}
+```
+
 중요 규칙:
 - code 필드에는 실행 가능한 완전한 코드만 작성하세요. 설명, 주석, 디버깅 메모,
   "debugger" 같은 관계없는 단어를 코드 중간에 절대 섞지 마세요.
 - 코드는 예시처럼 문법적으로 완전해야 하며, 마지막에 결과를 print()로 출력해야 합니다.
+- **code 안의 모든 파이썬 문자열은 반드시 작은따옴표(')만 사용하세요. 큰따옴표(")는 절대
+  쓰지 마세요.** code 자체가 이미 큰따옴표로 감싸인 JSON 문자열이라서, 안에서 또
+  큰따옴표를 쓰면 JSON 형식이 깨져 요청 전체가 실행되지 못합니다.
+  예: df = pd.DataFrame({'a': 1}) (O)  /  df = pd.DataFrame({"a": 1}) (X, 형식 깨짐)
+- **한 줄에는 문장을 하나만 쓰세요.** "def f(): a; b; c" 처럼 콜론 뒤에 여러 문장을
+  나열하지 마세요 - 파이썬 문법 오류입니다. 각 문장은 반드시 \\n으로 구분하세요.
+- **존재하지 않는 파일을 읽으려 하지 마세요** (pd.read_csv("파일명") 등 금지). 필요한
+  데이터는 예시 3처럼 코드 안에 딕셔너리/리스트로 직접 정의하세요. 이 샌드박스는
+  외부 파일이나 네트워크에 접근할 수 없습니다.
+- 그래프/차트/시각화가 필요한 요청은 반드시 예시 3의 패턴을 따르세요:
+  matplotlib.use('Agg')를 pyplot import 전에 반드시 호출하고, 그래프를 파일로 저장하지 말고
+  io.BytesIO()에 담아 base64로 인코딩한 뒤 "PLOT_BASE64:" 접두사와 함께 출력하세요.
+  (이 컨테이너는 디스플레이도 없고 파일시스템도 읽기 전용이라, 이 방식만 동작합니다.)
+- **막대/선 그래프의 x축이 카테고리(월, 이름, 항목 등)라면 반드시 예시 3처럼
+  ax.set_xticks(...)와 ax.set_xticklabels(...)를 명시적으로 호출해서 실제 카테고리
+  이름을 라벨로 지정하세요.** ax.bar()에 카테고리 값을 바로 넘기는 것만으로는
+  x축이 0, 1, 2... 같은 숫자 인덱스로 나올 수 있습니다.
+- 그래프에 한글 라벨/제목이 들어가면 반드시
+  plt.rcParams['font.family'] = 'NanumGothic' 을 pyplot import 직후에 추가하세요.
+  (기본 폰트는 한글을 지원하지 않아 글자가 깨집니다.)
 - 도구 호출이 필요 없는 단순 질문이면 그냥 일반 텍스트로 답하세요.
 - 한 번에 하나의 도구만 호출하세요."""
 
@@ -234,6 +261,20 @@ def to_gateway_payload(result: LayerResult, session_id: str) -> Optional[dict[st
         "tool": call.name,
         "args": call.args,
     }
+
+
+def looks_like_failed_tool_call(raw_output: str) -> bool:
+    """
+    tool_calls가 0건이더라도, LLM이 애초에 도구 호출을 "시도"는 했는데 형식이
+    깨져서(예: code 안에 이스케이프 안 된 큰따옴표) 파싱에 실패한 경우와,
+    처음부터 도구 호출 의도가 없던 일반 대화 응답을 구분하기 위한 휴리스틱이다.
+
+    포인트: 이 구분이 필요한 이유는 UX 때문이다. 후자는 LLM의 정상적인 답변이니
+    그대로 보여주면 되지만, 전자를 그대로 보여주면 사용자에게 깨진 JSON 잔해가
+    그대로 노출되어 "시스템이 고장났다"는 오해를 준다. chat_bridge.py가 이 함수의
+    결과에 따라 다른 메시지를 보여주도록 분기한다.
+    """
+    return '"tool"' in raw_output or "```json" in raw_output
 
 
 if __name__ == "__main__":

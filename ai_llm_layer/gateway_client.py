@@ -12,9 +12,9 @@
 
 사전 준비:
     Go 게이트웨이 빌드 및 실행 (별도 터미널)
-        go run event_relay_api.go
+        cd gateway && go run .
     정상이면 다음 로그가 뜬다:
-        이벤트 중계 API 게이트웨이 시작: :8080 (executor=Mock)
+        이벤트 중계 API 게이트웨이 시작: :8080 (executor=*main.DockerExecutor)
 """
 
 from __future__ import annotations

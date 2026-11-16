@@ -188,6 +188,27 @@
   }
   .resource-bar b { color: var(--text); }
 
+  .chart-panel {
+    margin: 0 20px 12px;
+    padding: 10px 12px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .chart-panel .chart-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    color: var(--text-dim);
+  }
+  .chart-panel .legend { display: flex; gap: 12px; }
+  .chart-panel .legend span { display: flex; align-items: center; gap: 4px; }
+  .chart-panel .legend .swatch { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+  .chart-panel canvas { display: block; width: 100%; height: 130px; }
+
   .session-list {
     flex: 1;
     overflow-y: auto;
@@ -211,6 +232,15 @@
   }
   .session-card .sid { color: var(--text-dim); }
   .session-card .tool { color: var(--accent); font-weight: 600; margin-top: 4px; font-size: 12px; }
+  .session-card .stats {
+    margin-top: 6px;
+    display: flex;
+    gap: 12px;
+    font-family: var(--mono);
+    font-size: 10.5px;
+  }
+  .session-card .stats .stat-label { color: var(--text-dim); }
+  .session-card .stats .stat-value { color: var(--accent); font-weight: 600; }
   .session-card .detail {
     margin-top: 6px;
     font-family: var(--mono);
@@ -257,6 +287,17 @@
       <span>CPU 코어: <b>0-1 LLM / 2-3 샌드박스</b></span>
       <span>동시 세션 상한: <b>2</b></span>
       <span>하드 타임아웃: <b>30초</b></span>
+      <span>웜스탠바이 풀: <b>1개</b></span>
+    </div>
+    <div class="chart-panel">
+      <div class="chart-head">
+        <span id="chart-session-label">실행 중인 세션 없음</span>
+        <div class="legend">
+          <span><i class="swatch" style="background:#4ec9b0"></i>CPU %</span>
+          <span><i class="swatch" style="background:#d29922"></i>MEM %</span>
+        </div>
+      </div>
+      <canvas id="resource-chart"></canvas>
     </div>
     <div class="session-list" id="session-list">
       <div class="empty-hint">아직 실행된 세션이 없습니다.</div>
@@ -269,21 +310,24 @@
 // 샌드박스 콘솔 프론트엔드
 // =====================================================================
 // 이 스크립트가 하는 일은 딱 두 가지다:
-//   1) 채팅 입력 -> ai_llm_layer.py가 하던 역할(POST /v1/execute) -> 폴링 -> 결과 표시
-//   2) 1초마다 GET /v1/sessions/all을 불러와 우측 모니터링 패널을 갱신
+//   1) 채팅 입력 -> chat_bridge.py(POST /chat) -> 결과 표시
+//   2) 1.5초마다 GET /v1/sessions/all을 불러와 우측 모니터링 패널을 갱신
 //
-// 포인트: 이 프론트엔드는 LLM 호출 자체는 하지 않는다. LLM 호출(Ollama)은
-// 여전히 Python(ai_llm_layer.py)의 책임이다. 하지만 데모/테스트 편의를 위해,
-// 이 파일은 간단한 요청은 게이트웨이가 아니라 별도의 작은 로컬 프록시를 통해
-// LLM까지 왕복하도록 구성한다 (아래 CHAT_ENDPOINT 참고).
-const GATEWAY = "http://localhost:8080";
+// 포인트: "localhost"로 하드코딩하지 않고 window.location.hostname을 그대로 쓴다.
+// 브라우저의 "localhost"는 항상 "이 페이지를 보고 있는 기기 자기 자신"을 가리키므로,
+// 원격 기기에서 호스트 노트북 IP로 이 페이지에 접속하면 "원격 기기 자신의 8080"을
+// 찾으려다 실패한다. window.location.hostname은 "이 HTML 파일을 어떤 주소로
+// 요청해서 받았는지"를 그대로 반영하므로, 로컬에서 열든 원격 IP로 열든 항상
+// 올바른 대상을 자동으로 가리키게 된다.
+const HOST = window.location.hostname;
+const GATEWAY = `http://${HOST}:8080`;
 
 // 포인트: 브라우저에서 직접 Ollama(:11434)를 호출하는 것도 기술적으로는 가능하지만,
 // 그러면 Tool Call 파서(tool_call_parser.py)의 검증을 건너뛰고 프론트엔드가
 // 화이트리스트 없이 임의 응답을 게이트웨이로 보내는 셈이 되어 보안 원칙이 깨진다.
-// 그래서 이 대시보드는 항상 게이트웨이 앞단에 서는 얇은 Python 브리지
-// (chat_bridge.py, 아래 안내 참고)를 통해서만 LLM 파이프라인을 태운다.
-const CHAT_ENDPOINT = "http://localhost:8000/chat";
+// 그래서 이 대시보드는 항상 얇은 Python 브리지(chat_bridge.py)를 통해서만
+// LLM 파이프라인을 태운다.
+const CHAT_ENDPOINT = `http://${HOST}:8000/chat`;
 
 const chatLog = document.getElementById("chat-log");
 const chatInput = document.getElementById("chat-text");
@@ -317,10 +361,35 @@ function appendAgentMessage({ statusText, statusClass, resultText, errorText, se
   div.appendChild(bubble);
 
   if (resultText) {
-    const code = document.createElement("div");
-    code.className = "code";
-    code.textContent = resultText;
-    div.appendChild(code);
+    // 포인트: run_code의 stdout 안에 "PLOT_BASE64:<데이터>"가 포함되어 있으면, 그 뒷부분은
+    // matplotlib이 만든 그래프를 base64로 인코딩한 것이다 (데이터 분석/시각화 시나리오,
+    // ai_llm_layer.py의 시스템 프롬프트 예시 3 참고). df.describe() 같은 텍스트 출력이
+    // PLOT_BASE64보다 먼저 나올 수 있으므로, startsWith(맨 앞부터 일치)가 아니라
+    // indexOf(문자열 어디에 있든 찾기)로 판단해야 한다.
+    const PLOT_PREFIX = "PLOT_BASE64:";
+    const plotIdx = resultText.indexOf(PLOT_PREFIX);
+
+    if (plotIdx !== -1) {
+      const textPart = resultText.slice(0, plotIdx).trim();
+      const b64Part = resultText.slice(plotIdx + PLOT_PREFIX.length).trim();
+
+      if (textPart) {
+        const code = document.createElement("div");
+        code.className = "code";
+        code.textContent = textPart;
+        div.appendChild(code);
+      }
+
+      const img = document.createElement("img");
+      img.src = "data:image/png;base64," + b64Part;
+      img.style.cssText = "max-width:100%;border-radius:6px;margin-top:8px;border:1px solid var(--border);";
+      div.appendChild(img);
+    } else {
+      const code = document.createElement("div");
+      code.className = "code";
+      code.textContent = resultText;
+      div.appendChild(code);
+    }
   }
   if (errorText) {
     const code = document.createElement("div");
@@ -366,6 +435,10 @@ async function sendChat() {
 
     if (data.status === "no_tool_call") {
       appendAgentMessage({ statusText: data.raw_output || "(도구 호출 없음)", statusClass: "completed" });
+    } else if (data.status === "parse_failed") {
+      // 포인트: chat_bridge.py가 "형식이 깨진 도구 호출 시도"를 감지해 친절한 안내 문구로
+      // 바꿔 보내주는 경우다. status-pill 클래스는 CSS에 정의된 failed 스타일을 그대로 쓴다.
+      appendAgentMessage({ statusText: data.raw_output, statusClass: "failed" });
     } else {
       appendAgentMessage({
         statusText: `실행 완료 (${data.status})`,
@@ -378,7 +451,7 @@ async function sendChat() {
   } catch (e) {
     pendingNode.remove();
     appendAgentMessage({
-      statusText: "chat_bridge.py에 연결할 수 없습니다. 아래 안내를 참고해 브리지를 먼저 실행해주세요.",
+      statusText: "chat_bridge.py에 연결할 수 없습니다. 브리지를 먼저 실행해주세요 (python3 chat_bridge.py).",
       statusClass: "failed",
     });
   } finally {
@@ -402,12 +475,24 @@ function renderSessions(sessions) {
     const card = document.createElement("div");
     card.className = "session-card";
     const started = new Date(s.started_at).toLocaleTimeString("ko-KR");
+
+    // 포인트: cpu_usage/mem_usage는 DockerExecutor가 실행 도중에만 채워 넣는 값이라
+    // (진짜 웜스탠바이 컨테이너를 docker stats로 실측), running 상태일 때만 의미가 있다.
+    // completed/failed 이후에는 마지막으로 관측된 값이 남아있을 뿐이므로 참고용으로만 표시한다.
+    const statsHtml = (s.cpu_usage || s.mem_usage)
+      ? `<div class="stats">
+           <span><span class="stat-label">CPU </span><span class="stat-value">${s.cpu_usage || "-"}</span></span>
+           <span><span class="stat-label">MEM </span><span class="stat-value">${s.mem_usage || "-"}</span></span>
+         </div>`
+      : "";
+
     card.innerHTML = `
       <div class="row1">
         <span class="sid">${s.id.slice(0, 8)}...</span>
         <span class="status-pill ${s.status}">${s.status}</span>
       </div>
       <div class="tool">${s.tool || "-"}</div>
+      ${statsHtml}
       <div class="detail">시작: ${started}${s.result ? "\n결과: " + s.result.slice(0, 120) : ""}${s.error ? "\n오류: " + s.error.slice(0, 120) : ""}</div>
     `;
     sessionList.appendChild(card);
@@ -418,11 +503,142 @@ async function pollSessions() {
   try {
     const resp = await fetch(`${GATEWAY}/v1/sessions/all`);
     const data = await resp.json();
-    renderSessions(data || []);
+    const sessions = data || [];
+    renderSessions(sessions);
+    updateChart(sessions);
     gwStatus.textContent = "연결됨";
   } catch (e) {
     gwStatus.textContent = "연결 안 됨";
   }
+}
+
+// ---------------- 실시간 CPU/메모리 그래프 ----------------
+// 포인트: 외부 차트 라이브러리(Chart.js 등)를 CDN으로 불러오면 이 대시보드 자체가
+// 인터넷 연결에 의존하게 된다. 이 프로젝트는 "완전 오프라인 온디바이스"가 핵심 전제라,
+// 대시보드도 예외를 두지 않고 순수 <canvas> API로 직접 그린다 - 새 의존성 0개.
+
+const MAX_POINTS = 40; // 폴링 주기 1.5초 기준 약 60초 분량의 히스토리
+const history = new Map(); // sessionId -> { cpu: number[], mem: number[] }
+
+function parseCpuPct(text) {
+  // "3.42%" -> 3.42
+  if (!text) return null;
+  const m = text.match(/([\d.]+)\s*%/);
+  return m ? parseFloat(m[1]) : null;
+}
+
+function parseMemPct(text) {
+  // "12.3MiB / 512MiB" -> 사용량을 상한 대비 백분율로 환산 (2.4)
+  if (!text) return null;
+  const m = text.match(/([\d.]+)\s*(\w+)\s*\/\s*([\d.]+)\s*(\w+)/);
+  if (!m) return null;
+  const toMiB = (value, unit) => {
+    unit = unit.toLowerCase();
+    if (unit.startsWith("kib") || unit.startsWith("kb")) return value / 1024;
+    if (unit.startsWith("gib") || unit.startsWith("gb")) return value * 1024;
+    return value; // MiB/MB는 그대로
+  };
+  const used = toMiB(parseFloat(m[1]), m[2]);
+  const limit = toMiB(parseFloat(m[3]), m[4]);
+  if (!limit) return null;
+  return (used / limit) * 100;
+}
+
+function recordStats(session) {
+  // running 상태일 때만 기록한다 - 완료/실패 이후의 값은 마지막 관측치일 뿐이라
+  // 그래프에 계속 이어붙이면 실제로는 멈춘 실행이 계속되는 것처럼 오해를 줄 수 있다.
+  if (session.status !== "running") return;
+  const cpu = parseCpuPct(session.cpu_usage);
+  const mem = parseMemPct(session.mem_usage);
+  if (cpu === null && mem === null) return;
+
+  let h = history.get(session.id);
+  if (!h) {
+    h = { cpu: [], mem: [] };
+    history.set(session.id, h);
+  }
+  h.cpu.push(cpu ?? 0);
+  h.mem.push(mem ?? 0);
+  if (h.cpu.length > MAX_POINTS) h.cpu.shift();
+  if (h.mem.length > MAX_POINTS) h.mem.shift();
+}
+
+function pickActiveSessionId(sessions) {
+  // 우선순위: 지금 running 중인 세션 > 가장 최근에 기록이 남은 세션(완료 직후 잔상 표시용)
+  const running = sessions.find((s) => s.status === "running" && history.has(s.id));
+  if (running) return running.id;
+  let latestId = null;
+  let latestTime = -Infinity;
+  for (const s of sessions) {
+    if (history.has(s.id)) {
+      const t = new Date(s.started_at).getTime();
+      if (t > latestTime) { latestTime = t; latestId = s.id; }
+    }
+  }
+  return latestId;
+}
+
+function drawChart(sessionId) {
+  const canvas = document.getElementById("resource-chart");
+  const label = document.getElementById("chart-session-label");
+  const dpr = window.devicePixelRatio || 1;
+  const cssWidth = canvas.clientWidth || 300;
+  const cssHeight = 130;
+  canvas.width = cssWidth * dpr;
+  canvas.height = cssHeight * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+  const h = sessionId ? history.get(sessionId) : null;
+  label.textContent = sessionId ? `세션 ${sessionId.slice(0, 8)}... 실시간 추이` : "실행 중인 세션 없음";
+
+  const padL = 30, padR = 6, padT = 8, padB = 16;
+  const plotW = cssWidth - padL - padR;
+  const plotH = cssHeight - padT - padB;
+
+  // 격자선 + y축 라벨 (0/25/50/75/100%)
+  ctx.strokeStyle = "rgba(255,255,255,0.08)";
+  ctx.fillStyle = "#6b7a89";
+  ctx.font = "9px monospace";
+  ctx.lineWidth = 1;
+  for (let pct = 0; pct <= 100; pct += 25) {
+    const y = padT + plotH * (1 - pct / 100);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+    ctx.stroke();
+    ctx.fillText(`${pct}`, 2, y + 3);
+  }
+
+  if (!h || h.cpu.length < 2) {
+    ctx.fillStyle = "#6b7a89";
+    ctx.font = "11px sans-serif";
+    ctx.fillText("데이터 수집 중... (요청을 보내면 그래프가 그려집니다)", padL + 8, padT + plotH / 2);
+    return;
+  }
+
+  const drawLine = (series, color) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    const n = series.length;
+    series.forEach((v, i) => {
+      const x = padL + (plotW * i) / Math.max(n - 1, 1);
+      const y = padT + plotH * (1 - Math.min(v, 100) / 100);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  };
+
+  drawLine(h.cpu, "#4ec9b0"); // CPU - teal (브랜드 시그니처 컬러)
+  drawLine(h.mem, "#d29922"); // MEM - amber (running 상태 컬러와 통일)
+}
+
+function updateChart(sessions) {
+  for (const s of sessions) recordStats(s);
+  drawChart(pickActiveSessionId(sessions));
 }
 
 pollSessions();

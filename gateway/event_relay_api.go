@@ -8,11 +8,10 @@
 //   2) 실행 인터페이스  -> SandboxExecutor 인터페이스
 //
 // 왜 이 둘을 인터페이스로 분리했는가:
-//   지금은 ③ 인프라/보안 계층(샌드박스 매니저)이 아직 없으므로,
 //   MockExecutor라는 가짜 구현체로 전체 파이프라인(AI/LLM -> 게이트웨이)을
-//   먼저 검증할 수 있다. 나중에 실제 Docker 실행 로직을 만들 때는
-//   SandboxExecutor 인터페이스만 구현해서 NewGateway에 주입하면 되고,
-//   Gateway 구조체나 HTTP 핸들러 코드는 단 한 줄도 고칠 필요가 없다.
+//   먼저 검증한 뒤, 실제 Docker 실행 로직(DockerExecutor)은 SandboxExecutor
+//   인터페이스만 구현해서 NewGateway에 주입했다. Gateway 구조체나 HTTP 핸들러
+//   코드는 단 한 줄도 고칠 필요가 없었다.
 //   이것이 "실행 인터페이스를 별도 계약으로 둔다"의 실질적 의미다.
 package main
 
@@ -36,8 +35,6 @@ const (
 
 	// 세션 하나가 허용되는 최대 실행 시간.
 	// 포인트: tool_call_parser.py의 MAX_TIMEOUT_SEC(30)과 반드시 같은 값으로 유지할 것.
-	// 두 계층의 타임아웃 정책이 어긋나면, "왜 파서는 30초를 허용한다는데
-	// 실제로는 다른 시간에 끊기지?" 같은 디버깅하기 어려운 불일치가 생긴다.
 	SessionTimeout = 30 * time.Second
 )
 
@@ -67,34 +64,41 @@ type SessionState struct {
 	StartedAt time.Time `json:"started_at"`
 	Result    string    `json:"result,omitempty"`
 	Error     string    `json:"error,omitempty"`
+	CPUUsage  string    `json:"cpu_usage,omitempty"` // 예: "3.42%" (docker stats 실측치)
+	MemUsage  string    `json:"mem_usage,omitempty"` // 예: "12.5MiB / 512MiB"
 }
 
 // -----------------------------------------------------------------------
 // 실행 인터페이스 (백엔드/파이프라인 계층의 두 번째 컴포넌트)
 // -----------------------------------------------------------------------
 
+// StatsCallback: 실행 중인 컨테이너의 CPU/메모리 실측치를 주기적으로 보고하는 콜백.
+// 포인트: "실행"과 "모니터링"의 책임을 분리하기 위해 Run()의 인자로 넘긴다.
+// DockerExecutor는 주기적으로 이 콜백을 호출해 최신 수치를 흘려보내기만 하고,
+// 그 값을 세션 상태에 저장하고 대시보드에 노출하는 건 게이트웨이의 책임이다.
+type StatsCallback func(cpuPct string, memUsage string)
+
 // SandboxExecutor: "샌드박스에 무엇을, 어떤 형식으로 넘길지"에 대한 계약(contract).
-// ③ 인프라/보안 계층을 구현할 때, 이 인터페이스를 만족하는 구조체(예: DockerExecutor)를
-// 하나 더 만들어서 NewGateway(dockerExecutor)로 교체하기만 하면 된다.
 type SandboxExecutor interface {
 	// Run: 도구 이름과 인자를 받아 실행하고, 결과 문자열 또는 에러를 반환한다.
 	// ctx가 취소(타임아웃)되면 구현체는 반드시 실행 중인 프로세스/컨테이너를
-	// 강제 종료해야 한다 (그렇지 않으면 타임아웃 났지만 컨테이너는 계속 도는
-	// 자원 누수가 발생한다 - 실제 Docker 구현 시 반드시 지켜야 할 계약 조건).
-	Run(ctx context.Context, tool string, args map[string]interface{}) (string, error)
+	// 강제 종료해야 한다 (그렇지 않으면 자원 누수가 발생한다).
+	// onStats: nil이 아니면 구현체가 실행 도중 주기적으로 CPU/메모리 실측치를 보고한다.
+	Run(ctx context.Context, tool string, args map[string]interface{}, onStats StatsCallback) (string, error)
 }
 
-// MockExecutor: 샌드박스 매니저가 아직 없을 때 파이프라인 전체(AI/LLM -> 게이트웨이)를
-// 먼저 검증하기 위한 임시 구현체. 실제 코드를 실행하지 않고, 받은 요청을 그대로
-// 텍스트로 되돌려주기만 한다.
+// MockExecutor: 실제 코드를 실행하지 않고, 받은 요청을 그대로 텍스트로 되돌려주는
+// 임시 구현체. Docker가 없는 환경에서 파이프라인을 검증하기 위한 폴백으로 쓰인다.
 type MockExecutor struct{}
 
-func (m *MockExecutor) Run(ctx context.Context, tool string, args map[string]interface{}) (string, error) {
-	// 실제 실행에 걸리는 지연을 흉내만 낸다.
+func (m *MockExecutor) Run(ctx context.Context, tool string, args map[string]interface{}, onStats StatsCallback) (string, error) {
 	select {
 	case <-time.After(200 * time.Millisecond):
 	case <-ctx.Done():
 		return "", ctx.Err()
+	}
+	if onStats != nil {
+		onStats("0.00%", "0MiB / 0MiB (mock)")
 	}
 	return fmt.Sprintf("[MOCK 실행 결과] tool=%s args=%v (실제 샌드박스 미연결 상태)", tool, args), nil
 }
@@ -102,16 +106,15 @@ func (m *MockExecutor) Run(ctx context.Context, tool string, args map[string]int
 // ===== 게이트웨이 상태 =====
 
 type Gateway struct {
-	sem      chan struct{}    // 동시 세션 수 제한용 세마포어 (버퍼드 채널)
-	sessions sync.Map         // sessionID -> *SessionState
-	executor SandboxExecutor  // 실제 실행을 위임할 대상 (지금은 MockExecutor)
+	sem      chan struct{}   // 동시 세션 수 제한용 세마포어 (버퍼드 채널)
+	sessions sync.Map        // sessionID -> *SessionState
+	executor SandboxExecutor // 실제 실행을 위임할 대상
 }
 
 // NewGateway: executor를 외부에서 주입받는다 (의존성 주입).
-// 이렇게 생성자에서 주입받는 구조로 만들어두면, 나중에 실제 Docker 기반
-// 샌드박스 매니저가 준비됐을 때 main()의 이 한 줄만 바꾸면 전체 시스템이 교체된다.
-//   gw := NewGateway(&MockExecutor{})       // 지금
-//   gw := NewGateway(&DockerExecutor{...})  // 나중에
+//
+//	gw := NewGateway(&MockExecutor{})   // 개발 초기
+//	gw := NewGateway(dockerExecutor)    // 현재
 func NewGateway(executor SandboxExecutor) *Gateway {
 	return &Gateway{
 		sem:      make(chan struct{}, MaxConcurrentSessions),
@@ -123,8 +126,7 @@ func NewGateway(executor SandboxExecutor) *Gateway {
 
 // handleExecute: POST /v1/execute
 // 처리 흐름: 스키마 검증 -> 세마포어 논블로킹 획득 시도 -> 성공 시 비동기 실행 위임.
-// 동시성 초과 시 큐잉하지 않고 즉시 429로 거부한다 (온디바이스 CPU 보호가 우선이라는
-// 설계 판단 - 무한 대기열보다 클라이언트의 명시적 재시도가 더 안전하다고 봤다).
+// 동시성 초과 시 큐잉하지 않고 즉시 429로 거부한다 (온디바이스 CPU 보호 우선).
 func (g *Gateway) handleExecute(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -170,10 +172,7 @@ func (g *Gateway) handleSessionStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSessionsAll: GET /v1/sessions/all
-// 모니터링 대시보드 프론트엔드가 전체 세션 목록을 한 번에 가져오기 위한 엔드포인트.
-// 포인트: gateway_client.py의 폴링(단일 세션 조회)과는 목적이 다르다 -
-// 이 엔드포인트는 "지금까지 무슨 세션들이 있었는지"를 보여주는 대시보드 전용이다.
-// 최근 것부터 보여주기 위해 StartedAt 기준 내림차순으로 정렬한다.
+// 모니터링 대시보드 전용: 전체 세션 목록을 최근 것부터(StartedAt 내림차순) 반환한다.
 func (g *Gateway) handleSessionsAll(w http.ResponseWriter, r *http.Request) {
 	var all []*SessionState
 	g.sessions.Range(func(_, v interface{}) bool {
@@ -193,20 +192,15 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// withCORS: 프론트엔드(브라우저)가 다른 출처(예: file:// 또는 다른 포트로 열린 정적 HTML)에서
-// 이 API를 호출할 수 있도록 CORS 헤더를 붙여주는 미들웨어.
-//
-// 포인트: 브라우저는 보안상 "다른 출처의 API를 기본적으로 차단"하는데(CORS 정책),
-// 이 헤더가 없으면 프론트엔드의 fetch() 호출이 브라우저 단에서 막혀버린다.
-// 지금은 로컬 개발 단계라 "*"(모든 출처 허용)로 단순하게 열어뒀지만,
-// 실제 배포 시에는 프론트엔드가 서빙되는 정확한 출처로 좁히는 것이 안전하다.
+// withCORS: 브라우저(대시보드)가 다른 출처에서 이 API를 호출할 수 있도록 CORS 헤더를 붙인다.
+// 지금은 로컬 개발 단계라 "*"로 열어뒀지만, 배포 시에는 정확한 출처로 좁히는 것이 안전하다.
 func withCORS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
-			// 브라우저가 실제 요청 전에 미리 보내는 preflight 요청 - 본 로직 없이 200만 반환
+			// 브라우저 preflight 요청 - 본 로직 없이 200만 반환
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -225,11 +219,14 @@ func (g *Gateway) runSession(req ExecuteRequest, state *SessionState) {
 	resultCh := make(chan string, 1)
 	errCh := make(chan error, 1)
 
+	// onStats: DockerExecutor가 주기적으로 호출하는 콜백. 실행 도중 세션 상태에
+	// CPU/메모리 실측치를 반영해서, 대시보드가 폴링할 때마다 최신 값을 볼 수 있게 한다.
+	onStats := func(cpu, mem string) {
+		g.updateSessionStats(req.SessionID, cpu, mem)
+	}
+
 	go func() {
-		// 실제 실행은 executor(지금은 MockExecutor, 나중엔 DockerExecutor)에 완전히 위임한다.
-		// 게이트웨이 코드는 "무엇을 실행하는지"를 전혀 알 필요가 없다 -
-		// 이것이 인터페이스로 분리한 핵심 이점이다.
-		result, err := g.executor.Run(ctx, req.Tool, req.Args)
+		result, err := g.executor.Run(ctx, req.Tool, req.Args, onStats)
 		if err != nil {
 			errCh <- err
 			return
@@ -237,21 +234,58 @@ func (g *Gateway) runSession(req ExecuteRequest, state *SessionState) {
 		resultCh <- result
 	}()
 
+	// 포인트: 최종 상태는 최신 스냅샷(모니터링 수치가 반영된 것)을 "복사"해서 만든다.
+	// 기존 state 포인터를 직접 수정하면 (1) updateSessionStats가 저장한 CPU/MEM 값이
+	// 덮어써져 사라지고 (2) 대시보드가 JSON 인코딩 중인 객체를 동시에 쓰는 경쟁 상태가 생긴다.
+	var final SessionState
 	select {
 	case result := <-resultCh:
-		state.Status = "completed"
-		state.Result = result
+		final = g.snapshot(req.SessionID, state)
+		final.Status = "completed"
+		final.Result = result
 		log.Printf("[완료] session=%s", req.SessionID)
 	case err := <-errCh:
-		state.Status = "failed"
-		state.Error = err.Error()
+		final = g.snapshot(req.SessionID, state)
+		final.Status = "failed"
+		final.Error = err.Error()
 		log.Printf("[실패] session=%s: %v", req.SessionID, err)
 	case <-ctx.Done():
-		state.Status = "timeout"
-		state.Error = "실행 시간 초과 (하드 타임아웃)"
+		final = g.snapshot(req.SessionID, state)
+		final.Status = "timeout"
+		final.Error = "실행 시간 초과 (하드 타임아웃)"
 		log.Printf("[타임아웃] session=%s", req.SessionID)
 	}
-	g.sessions.Store(req.SessionID, state)
+	g.sessions.Store(req.SessionID, &final)
+}
+
+// snapshot: sync.Map에 저장된 현재 세션 상태의 값 복사본을 반환한다.
+func (g *Gateway) snapshot(sessionID string, fallback *SessionState) SessionState {
+	if v, ok := g.sessions.Load(sessionID); ok {
+		if s, ok := v.(*SessionState); ok {
+			return *s
+		}
+	}
+	return *fallback
+}
+
+// updateSessionStats: 실행 도중 CPU/메모리 실측치로 세션 상태를 갱신한다.
+//
+// 포인트: state 포인터의 필드를 직접 수정하지 않고, 기존 값을 복사해서 새 필드만
+// 바꾼 뒤 새 포인터로 다시 Store한다. 두 goroutine이 같은 메모리를 동시에 쓰는
+// 경쟁 상태를 피하기 위함이며, "재사용 대신 새로 만들어 교체" 원칙과도 일치한다.
+func (g *Gateway) updateSessionStats(sessionID, cpu, mem string) {
+	v, ok := g.sessions.Load(sessionID)
+	if !ok {
+		return
+	}
+	current, ok := v.(*SessionState)
+	if !ok {
+		return
+	}
+	updated := *current // 값 복사 (필드가 전부 string/time이라 얕은 복사로 충분)
+	updated.CPUUsage = cpu
+	updated.MemUsage = mem
+	g.sessions.Store(sessionID, &updated)
 }
 
 // ===== 유틸 =====
@@ -264,10 +298,9 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 
 func main() {
 	// ③ 인프라/보안 계층 연동: DockerExecutor를 우선 시도하고,
-	// Docker 데몬 연결 자체가 안 되면(개발 초기 단계 등) MockExecutor로 자동 폴백한다.
+	// Docker 데몬 연결 자체가 안 되면 MockExecutor로 자동 폴백한다.
 	// 포인트: 이 폴백은 "개발 편의"일 뿐이다. 실제 배포 시에는 폴백 없이
-	// DockerExecutor 생성 실패를 즉시 log.Fatal로 처리해, 격리 없이 서비스가
-	// 떠 있는 상황(=보안 사고)을 방지하는 것이 맞다.
+	// log.Fatal로 처리해, 격리 없이 서비스가 떠 있는 상황(=보안 사고)을 방지하는 것이 맞다.
 	var executor SandboxExecutor
 	dockerExec, err := NewDockerExecutor()
 	if err != nil {
@@ -286,14 +319,13 @@ func main() {
 
 	gw := NewGateway(executor)
 
-	// 포인트: 프론트엔드(대시보드) 추가에 맞춰 모든 라우트를 withCORS로 감쌌다.
-	// gateway_client.py 같은 서버 간 통신은 CORS의 영향을 받지 않으므로
-	// (CORS는 브라우저에서만 강제되는 정책), 이 변경이 기존 Python 클라이언트
-	// 동작에는 전혀 영향을 주지 않는다.
+	// withCFAccess로 한 번 더 감싸서, Cloudflare Access를 통과한 요청인지 게이트웨이
+	// 스스로도 검증하게 한다 (엣지에서만 막고 서버는 무방비인 상태를 피하기 위함).
+	// /healthz는 예외: 민감한 정보를 노출하지 않으므로 인증을 요구하지 않는다.
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/execute", withCORS(gw.handleExecute))
-	mux.HandleFunc("/v1/sessions", withCORS(gw.handleSessionStatus))
-	mux.HandleFunc("/v1/sessions/all", withCORS(gw.handleSessionsAll))
+	mux.HandleFunc("/v1/execute", withCORS(withCFAccess(gw.handleExecute)))
+	mux.HandleFunc("/v1/sessions", withCORS(withCFAccess(gw.handleSessionStatus)))
+	mux.HandleFunc("/v1/sessions/all", withCORS(withCFAccess(gw.handleSessionsAll)))
 	mux.HandleFunc("/healthz", withCORS(gw.handleHealth))
 
 	log.Printf("이벤트 중계 API 게이트웨이 시작: :8080 (executor=%T)", executor)
